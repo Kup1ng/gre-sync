@@ -1,0 +1,15 @@
+role: $role
+listen: 0.0.0.0
+port: 8787
+token: "CHANGE_ME_LONG_RANDOM"
+
+check_interval_sec: 30
+ping_count: 7
+ping_timeout_sec: 1
+loss_ok_percent: 20
+
+fail_confirm_rounds: 3
+reset_wait_sec: 300
+
+# اگر روی ایران چند خارج مختلف داری، اینجا لازم نیست دستی تعریف کنی
+# چون peer public ip از روی خود interface کشف میشه.
