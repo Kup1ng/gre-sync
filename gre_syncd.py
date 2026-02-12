@@ -7,8 +7,9 @@ import re
 import signal
 import subprocess
 import time
+import random
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Any
 
 import aiohttp
 from aiohttp import web
@@ -55,14 +56,11 @@ def parse_gre_ifaces() -> Dict[str, GreIface]:
       - local_private from `ip -o -4 addr show dev`
       - peer_private computed from /30
     """
-    # Grab link info (contains "link/gre <local> peer <peer>")
     link_out = sh(["ip", "-o", "link", "show"])
     link_lines = link_out.splitlines()
 
-    # Map iface -> (local_public, peer_public)
     pub_map: Dict[str, Tuple[str, str]] = {}
     for line in link_lines:
-        # Example fragment: "link/gre 89.42... peer 5.75..."
         m = re.search(r":\s+(\S+?)@.*\s+.*link/gre\s+(\S+)\s+peer\s+(\S+)", line)
         if not m:
             continue
@@ -75,12 +73,10 @@ def parse_gre_ifaces() -> Dict[str, GreIface]:
     if not pub_map:
         return {}
 
-    # Grab v4 addresses
     addr_out = sh(["ip", "-o", "-4", "addr", "show"])
     addr_lines = addr_out.splitlines()
     v4_map: Dict[str, str] = {}
     for line in addr_lines:
-        # Example: "24: gre-ir-15    inet 172.17.15.1/30 ..."
         m = re.search(r"^\d+:\s+(\S+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)", line)
         if not m:
             continue
@@ -88,7 +84,6 @@ def parse_gre_ifaces() -> Dict[str, GreIface]:
         if IF_RE.match(ifname):
             ip = m.group(2)
             prefix = int(m.group(3))
-            # we only use /30 style, but keep anyway
             v4_map[ifname] = f"{ip}/{prefix}"
 
     res: Dict[str, GreIface] = {}
@@ -101,12 +96,10 @@ def parse_gre_ifaces() -> Dict[str, GreIface]:
 
         cidr = v4_map.get(ifname)
         if not cidr:
-            # no private address => skip
             continue
 
         iface_ip = ipaddress.ip_interface(cidr)
         net = iface_ip.network
-        # peer ip is "the other host" inside the subnet
         hosts = list(net.hosts())
         if len(hosts) < 2:
             continue
@@ -125,12 +118,6 @@ def parse_gre_ifaces() -> Dict[str, GreIface]:
     return res
 
 async def ping_loss_percent(ip: str, count: int, timeout_sec: int) -> Optional[float]:
-    """
-    Returns packet loss percent as float.
-    None if ping command fails unexpectedly.
-    """
-    # -W: per-packet timeout (seconds)
-    # -c: count
     cmd = ["ping", "-n", "-q", "-c", str(count), "-W", str(timeout_sec), ip]
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -146,7 +133,6 @@ async def ping_loss_percent(ip: str, count: int, timeout_sec: int) -> Optional[f
         return None
 
 async def ip_link_set(ifname: str, state: str) -> bool:
-    # state: "up" / "down"
     cmd = ["ip", "link", "set", "dev", ifname, state]
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -176,11 +162,17 @@ class GreSyncD:
         self.fail_rounds = int(cfg.get("fail_confirm_rounds", 3))
         self.reset_wait = int(cfg.get("reset_wait_sec", 300))
 
+        # retry tuning (optional in config)
+        self.http_tries = int(cfg.get("http_tries", 3))
+        self.http_timeout = int(cfg.get("http_timeout_sec", 6))
+        self.http_backoff_base = float(cfg.get("http_backoff_base", 0.7))
+        self.http_backoff_cap = float(cfg.get("http_backoff_cap", 6.0))
+        self.http_jitter_ratio = float(cfg.get("http_jitter_ratio", 0.25))
+
         # state
         self._stop = asyncio.Event()
-        self._locks: Dict[str, asyncio.Lock] = {}  # per tunnel id lock
-        self._bad_streak: Dict[str, int] = {}      # per iface bad streak count
-
+        self._locks: Dict[str, asyncio.Lock] = {}
+        self._bad_streak: Dict[str, int] = {}
         self._session: Optional[aiohttp.ClientSession] = None
 
     def log(self, *a):
@@ -231,10 +223,6 @@ class GreSyncD:
         return web.json_response({"ok": ok, "ifname": ifname, "action": action})
 
     async def api_barrier(self, request: web.Request):
-        """
-        Barrier: leader calls follower to ensure follower is reachable and has the iface.
-        follower replies ready=true/false.
-        """
         if not self.auth_ok(request):
             return web.json_response({"ok": False, "err": "unauthorized"}, status=401)
         data = await request.json()
@@ -246,23 +234,58 @@ class GreSyncD:
         ready = ifname in ifaces
         return web.json_response({"ok": True, "ready": ready, "ts_ms": now_ms()})
 
-    # ----- Coordination -----
+    # ----- Coordination (HTTP with retry) -----
 
     async def call_peer(self, peer_ip: str, path: str, payload: dict, timeout: int = 5) -> dict:
+        if not self._session:
+            raise RuntimeError("HTTP session not ready")
         url = f"http://{peer_ip}:{self.port}{path}"
         headers = {"Authorization": f"Bearer {self.token}"}
-        assert self._session
         async with self._session.post(url, json=payload, headers=headers, timeout=timeout) as r:
             return await r.json()
+
+    async def call_peer_retry(
+        self,
+        peer_ip: str,
+        path: str,
+        payload: dict,
+        timeout: Optional[int] = None,
+        tries: Optional[int] = None,
+        backoff_base: Optional[float] = None,
+        backoff_cap: Optional[float] = None,
+    ) -> dict:
+        """
+        Retry wrapper for peer HTTP calls with exponential backoff + jitter.
+        If all tries fail, returns {"ok": False, ...}.
+        """
+        timeout = int(timeout if timeout is not None else self.http_timeout)
+        tries = int(tries if tries is not None else self.http_tries)
+        backoff_base = float(backoff_base if backoff_base is not None else self.http_backoff_base)
+        backoff_cap = float(backoff_cap if backoff_cap is not None else self.http_backoff_cap)
+
+        last_err = None
+        for attempt in range(1, tries + 1):
+            try:
+                return await self.call_peer(peer_ip, path, payload, timeout=timeout)
+            except Exception as e:
+                last_err = str(e)
+                if attempt >= tries:
+                    break
+                delay = min(backoff_cap, backoff_base * (2 ** (attempt - 1)))
+                delay = delay + random.uniform(0, self.http_jitter_ratio * delay)
+                self.log(f"peer retry {attempt}/{tries} {peer_ip}{path} err={e} sleep={delay:.2f}s")
+                await asyncio.sleep(delay)
+
+        return {"ok": False, "err": "peer_unreachable", "detail": last_err, "path": path, "peer": peer_ip}
 
     async def coordinated_reset_as_leader(self, iface: GreIface):
         """
         Leader (Iran) does:
-          - barrier with peer
-          - DOWN local+peer (nearly simultaneously)
-          - wait 300s
+          - barrier with peer (with retry)
+          - DOWN local+peer (parallel) (peer DOWN must succeed or abort)
+          - wait reset_wait
           - UP local
-          - UP peer
+          - UP peer (with stronger retry)
         """
         key = f"{iface.peer_public}:{iface.num}"
         lock = self.lock_for(key)
@@ -274,25 +297,29 @@ class GreSyncD:
             peer_name = peer_ifname(iface)
             self.log(f"[{iface.name}] Coordinated reset START with {iface.peer_public} peer_if={peer_name}")
 
-            # barrier
-            try:
-                b = await self.call_peer(iface.peer_public, "/barrier", {"ifname": peer_name})
-                if not b.get("ok") or not b.get("ready"):
-                    self.log(f"[{iface.name}] peer barrier not ready -> {b}")
-                    return
-            except Exception as e:
-                self.log(f"[{iface.name}] peer barrier failed: {e}")
+            # barrier (must succeed, otherwise abort)
+            b = await self.call_peer_retry(iface.peer_public, "/barrier", {"ifname": peer_name}, timeout=6, tries=3)
+            if not b.get("ok") or not b.get("ready"):
+                self.log(f"[{iface.name}] peer barrier not ready -> {b}")
                 return
 
-            # down both (parallel)
-            try:
-                down_peer = self.call_peer(iface.peer_public, "/action", {"action": "down", "ifname": peer_name}, timeout=8)
-                down_local = ip_link_set(iface.name, "down")
-                r_peer, r_local = await asyncio.gather(down_peer, down_local, return_exceptions=True)
-                self.log(f"[{iface.name}] DOWN local={r_local} peer={r_peer}")
-            except Exception as e:
-                self.log(f"[{iface.name}] DOWN phase error: {e}")
-                # continue anyway
+            # down both (peer down must succeed or we abort and restore local up)
+            down_peer_task = self.call_peer_retry(
+                iface.peer_public, "/action", {"action": "down", "ifname": peer_name}, timeout=8, tries=3
+            )
+            down_local_task = ip_link_set(iface.name, "down")
+
+            r_peer, r_local = await asyncio.gather(down_peer_task, down_local_task, return_exceptions=True)
+
+            peer_down_ok = isinstance(r_peer, dict) and r_peer.get("ok") is True
+            local_down_ok = (r_local is True)
+            self.log(f"[{iface.name}] DOWN local={local_down_ok} peer={r_peer}")
+
+            if not peer_down_ok:
+                # prevent mismatch: bring local back up and abort
+                self.log(f"[{iface.name}] peer DOWN failed -> abort reset, restoring local UP")
+                await ip_link_set(iface.name, "up")
+                return
 
             await asyncio.sleep(self.reset_wait)
 
@@ -300,38 +327,32 @@ class GreSyncD:
             up_local_ok = await ip_link_set(iface.name, "up")
             self.log(f"[{iface.name}] UP local -> {up_local_ok}")
 
-            # then peer up
-            try:
-                r = await self.call_peer(iface.peer_public, "/action", {"action": "up", "ifname": peer_name}, timeout=8)
-                self.log(f"[{iface.name}] UP peer -> {r}")
-            except Exception as e:
-                self.log(f"[{iface.name}] UP peer failed: {e}")
+            # then peer up (more retries because peer may be slow)
+            r_up = await self.call_peer_retry(
+                iface.peer_public, "/action", {"action": "up", "ifname": peer_name},
+                timeout=8, tries=5, backoff_base=1.0, backoff_cap=12.0
+            )
+            self.log(f"[{iface.name}] UP peer -> {r_up}")
 
             self.log(f"[{iface.name}] Coordinated reset END")
 
     async def follower_report(self, iface: GreIface):
         """
         On KH side when it detects "public ok but private gre bad",
-        it tells IR leader to run reset.
-        Leader is the peer_public (Iran public).
+        it tells IR leader to run reset. Use retry (transient outages).
         """
         leader_ip = iface.peer_public
-        my_if = iface.name
-        # Tell leader which tunnel number; leader will find its gre-ir-N locally and run reset.
-        payload = {"ifnum": iface.num, "from_if": my_if, "from_peer": iface.local_public}
-        try:
-            # We reuse /report endpoint on leader implemented via /barrier? better create /report
-            # For simplicity, call /status just to verify reachable then leader will act by its own monitoring.
-            await self.call_peer(leader_ip, "/report", payload, timeout=8)
-        except Exception as e:
-            self.log(f"[{iface.name}] report leader failed: {e}")
+        payload = {"ifnum": iface.num, "from_if": iface.name, "from_peer": iface.local_public}
+        r = await self.call_peer_retry(
+            leader_ip, "/report", payload,
+            timeout=8, tries=5, backoff_base=1.0, backoff_cap=15.0
+        )
+        if not r.get("ok"):
+            self.log(f"[{iface.name}] report leader failed -> {r}")
 
     # ----- Monitoring loop -----
 
     async def check_one(self, iface: GreIface) -> Tuple[bool, bool]:
-        """
-        returns (public_ok, private_ok)
-        """
         loss_pub = await ping_loss_percent(iface.peer_public, self.ping_count, self.ping_timeout)
         loss_prv = await ping_loss_percent(iface.peer_private, self.ping_count, self.ping_timeout)
 
@@ -342,58 +363,52 @@ class GreSyncD:
     async def monitor_loop(self):
         self._session = aiohttp.ClientSession()
 
-        while not self._stop.is_set():
-            ifaces = parse_gre_ifaces()
-            if not ifaces:
-                self.log("No GRE ifaces found. Sleeping...")
-                await asyncio.sleep(self.check_interval)
-                continue
-
-            # check all concurrently
-            tasks = {name: asyncio.create_task(self.check_one(iface)) for name, iface in ifaces.items()}
-            results: Dict[str, Tuple[bool, bool]] = {}
-            for name, t in tasks.items():
-                try:
-                    results[name] = await t
-                except Exception:
-                    results[name] = (False, False)
-
-            # decide actions
-            for name, (pub_ok, prv_ok) in results.items():
-                iface = ifaces[name]
-
-                # rule table
-                if pub_ok and prv_ok:
-                    self._bad_streak[name] = 0
+        try:
+            while not self._stop.is_set():
+                ifaces = parse_gre_ifaces()
+                if not ifaces:
+                    self.log("No GRE ifaces found. Sleeping...")
+                    await asyncio.sleep(self.check_interval)
                     continue
 
-                if (not pub_ok) and (not prv_ok):
-                    # filtered / total outage -> do nothing, reset streak
-                    self._bad_streak[name] = 0
-                    continue
+                tasks = {name: asyncio.create_task(self.check_one(iface)) for name, iface in ifaces.items()}
+                results: Dict[str, Tuple[bool, bool]] = {}
+                for name, t in tasks.items():
+                    try:
+                        results[name] = await t
+                    except Exception:
+                        results[name] = (False, False)
 
-                if pub_ok and (not prv_ok):
-                    # candidate for reset after confirm rounds
-                    self._bad_streak[name] = self._bad_streak.get(name, 0) + 1
-                    streak = self._bad_streak[name]
-                    self.log(f"[{name}] public OK, private BAD streak={streak}")
+                for name, (pub_ok, prv_ok) in results.items():
+                    iface = ifaces[name]
 
-                    if streak >= self.fail_rounds:
+                    if pub_ok and prv_ok:
+                        self._bad_streak[name] = 0
+                        continue
+
+                    if (not pub_ok) and (not prv_ok):
+                        # filtered / total outage -> do nothing
+                        self._bad_streak[name] = 0
+                        continue
+
+                    if pub_ok and (not prv_ok):
+                        self._bad_streak[name] = self._bad_streak.get(name, 0) + 1
+                        streak = self._bad_streak[name]
+                        self.log(f"[{name}] public OK, private BAD streak={streak}")
+
+                        if streak >= self.fail_rounds:
+                            self._bad_streak[name] = 0
+
+                            if self.role == "ir" and iface.side == "ir":
+                                asyncio.create_task(self.coordinated_reset_as_leader(iface))
+                            elif self.role == "kh" and iface.side == "kh":
+                                asyncio.create_task(self.follower_report(iface))
+                    else:
                         self._bad_streak[name] = 0
 
-                        if self.role == "ir" and iface.side == "ir":
-                            # leader resets
-                            asyncio.create_task(self.coordinated_reset_as_leader(iface))
-                        elif self.role == "kh" and iface.side == "kh":
-                            # follower reports leader
-                            asyncio.create_task(self.follower_report(iface))
-                else:
-                    # public bad but private ok (rare) or other odd states -> don't reset, just clear
-                    self._bad_streak[name] = 0
-
-            await asyncio.sleep(self.check_interval)
-
-        await self._session.close()
+                await asyncio.sleep(self.check_interval)
+        finally:
+            await self._session.close()
 
     # ----- Leader report endpoint -----
 
@@ -409,7 +424,6 @@ class GreSyncD:
         if not ifnum.isdigit():
             return web.json_response({"ok": False, "err": "bad ifnum"}, status=400)
 
-        # Find local gre-ir-ifnum and reset if exists
         ifaces = parse_gre_ifaces()
         target_name = f"gre-ir-{ifnum}"
         iface = ifaces.get(target_name)
@@ -436,7 +450,6 @@ class GreSyncD:
         self.log("Starting monitor loop")
         task = asyncio.create_task(self.monitor_loop())
 
-        # shutdown signals
         loop = asyncio.get_running_loop()
         for s in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(s, self._stop.set)
