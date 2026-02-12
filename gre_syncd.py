@@ -196,7 +196,7 @@ class GreSyncD:
         self.reset_wait = int(cfg.get("reset_wait_sec", 300))
 
         # Delay between local UP and peer UP (IR only)
-        self.post_local_up_delay = int(cfg.get(\"post_local_up_delay_sec\", 10))
+        self.post_local_up_delay = int(cfg.get("post_local_up_delay_sec", 10))
 
         # KH: control-plane (ping IR public) before accepting actions
         self.kh_ctl_ping_count = int(cfg.get("kh_ctl_ping_count", 3))
