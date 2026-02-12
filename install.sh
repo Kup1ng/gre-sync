@@ -35,14 +35,22 @@ fetch() {
   fi
 }
 
+# Always prompt even with: curl ... | sudo bash
 ask() {
   local prompt="$1" default="${2:-}"
   local ans=""
-  if [[ -n "$default" ]]; then
-    read -r -p "$prompt [$default]: " ans
-    ans="${ans:-$default}"
+
+  if [[ -r /dev/tty ]]; then
+    if [[ -n "$default" ]]; then
+      read -r -p "$prompt [$default]: " ans </dev/tty
+      ans="${ans:-$default}"
+    else
+      read -r -p "$prompt: " ans </dev/tty
+    fi
   else
-    read -r -p "$prompt: " ans
+    # no tty (non-interactive)
+    ans="$default"
+    echo "[!] No TTY detected; using default for: $prompt = $ans" >&2
   fi
   echo "$ans"
 }
@@ -60,7 +68,6 @@ PY
 
 install_apt_deps() {
   apt-get update -y
-  # python3-venv برای ساخت venv لازمه
   apt-get install -y python3 python3-venv python3-pip curl
 }
 
@@ -104,14 +111,15 @@ EOF
   chmod +x "$BIN_WRAPPER"
 }
 
-render_config() {
-  local role="$1" listen="$2" port="$3" token="$4"
-  local check_interval="$5" ping_count="$6" ping_timeout="$7" loss_ok="$8"
-  local fail_rounds="$9" reset_wait="${10}"
+render_config_ir() {
+  local listen="$1" port="$2" token="$3"
+  local check_interval="$4" ping_count="$5" ping_timeout="$6" loss_ok="$7"
+  local fail_rounds="$8" reset_wait="$9"
+  local http_tries="${10}" http_timeout="${11}" http_backoff_base="${12}" http_backoff_cap="${13}" http_jitter_ratio="${14}"
 
   mkdir -p "$CFG_DIR"
   cat > "$CFG_FILE" <<EOF
-role: ${role}
+role: ir
 listen: ${listen}
 port: ${port}
 token: "${token}"
@@ -123,18 +131,49 @@ loss_ok_percent: ${loss_ok}
 
 fail_confirm_rounds: ${fail_rounds}
 reset_wait_sec: ${reset_wait}
+
+http_tries: ${http_tries}
+http_timeout_sec: ${http_timeout}
+http_backoff_base: ${http_backoff_base}
+http_backoff_cap: ${http_backoff_cap}
+http_jitter_ratio: ${http_jitter_ratio}
+EOF
+}
+
+render_config_kh() {
+  local listen="$1" port="$2" token="$3" leader_ip="$4"
+  local leader_ping_count="$5" leader_ping_timeout="$6" leader_loss_ok="$7"
+  local http_tries="$8" http_timeout="$9" http_backoff_base="${10}" http_backoff_cap="${11}" http_jitter_ratio="${12}"
+
+  mkdir -p "$CFG_DIR"
+  cat > "$CFG_FILE" <<EOF
+role: kh
+listen: ${listen}
+port: ${port}
+token: "${token}"
+
+leader_public_ip: "${leader_ip}"
+leader_ping_count: ${leader_ping_count}
+leader_ping_timeout_sec: ${leader_ping_timeout}
+leader_loss_ok_percent: ${leader_loss_ok}
+
+http_tries: ${http_tries}
+http_timeout_sec: ${http_timeout}
+http_backoff_base: ${http_backoff_base}
+http_backoff_cap: ${http_backoff_cap}
+http_jitter_ratio: ${http_jitter_ratio}
 EOF
 }
 
 main() {
   need_root
 
-  echo "=== GRE Sync installer (venv / PEP668-safe) ==="
+  echo "=== GRE Sync installer (role-aware / venv / PEP668-safe) ==="
   echo "Repo: $REPO_RAW_BASE"
   echo
 
   if ! has_cmd apt-get; then
-    echo "[!] This installer currently supports Debian/Ubuntu (apt-get)."
+    echo "[!] This installer supports Debian/Ubuntu (apt-get)."
     exit 1
   fi
 
@@ -162,22 +201,46 @@ main() {
   fi
 
   listen="$(ask "API listen address" "0.0.0.0")"
-  port="$(ask "API port" "8787")"
+  port="$(ask "API port (must match both sides)" "8787")"
 
   token_default="$(gen_token)"
   token="$(ask "Shared token (must be same on both sides)" "$token_default")"
 
-  check_interval="$(ask "Check interval (sec)" "30")"
-  ping_count="$(ask "Ping count per check" "7")"
-  ping_timeout="$(ask "Ping timeout per packet (sec)" "1")"
-  loss_ok="$(ask "Loss threshold percent (< this = OK)" "20")"
+  # HTTP retry knobs (both roles)
+  http_tries="$(ask "HTTP tries (peer API retry count)" "3")"
+  http_timeout="$(ask "HTTP timeout (sec)" "6")"
+  http_backoff_base="$(ask "HTTP backoff base (sec)" "0.7")"
+  http_backoff_cap="$(ask "HTTP backoff cap (sec)" "6.0")"
+  http_jitter_ratio="$(ask "HTTP jitter ratio" "0.25")"
 
-  fail_rounds="$(ask "Fail confirm rounds (consecutive)" "3")"
-  reset_wait="$(ask "Reset wait before up (sec)" "300")"
+  if [[ "$role" == "ir" ]]; then
+    check_interval="$(ask "GRE check interval (sec)" "30")"
+    ping_count="$(ask "Ping count per check" "7")"
+    ping_timeout="$(ask "Ping timeout per packet (sec)" "1")"
+    loss_ok="$(ask "Loss threshold percent (< this = OK)" "20")"
 
-  render_config "$role" "$listen" "$port" "$token" \
-                "$check_interval" "$ping_count" "$ping_timeout" "$loss_ok" \
-                "$fail_rounds" "$reset_wait"
+    fail_rounds="$(ask "Fail confirm rounds (consecutive)" "3")"
+    reset_wait="$(ask "Reset wait before UP (sec)" "300")"
+
+    render_config_ir "$listen" "$port" "$token" \
+      "$check_interval" "$ping_count" "$ping_timeout" "$loss_ok" \
+      "$fail_rounds" "$reset_wait" \
+      "$http_tries" "$http_timeout" "$http_backoff_base" "$http_backoff_cap" "$http_jitter_ratio"
+  else
+    leader_ip="$(ask "Leader public IP (Iran public IP)" "")"
+    if [[ -z "$leader_ip" ]]; then
+      echo "[!] leader_public_ip is required for role=kh"
+      exit 1
+    fi
+
+    leader_ping_count="$(ask "Leader ping count" "3")"
+    leader_ping_timeout="$(ask "Leader ping timeout per packet (sec)" "1")"
+    leader_loss_ok="$(ask "Leader loss threshold percent (< this = OK)" "20")"
+
+    render_config_kh "$listen" "$port" "$token" "$leader_ip" \
+      "$leader_ping_count" "$leader_ping_timeout" "$leader_loss_ok" \
+      "$http_tries" "$http_timeout" "$http_backoff_base" "$http_backoff_cap" "$http_jitter_ratio"
+  fi
 
   echo
   echo "[6/7] Installing systemd service + CLI wrapper..."
