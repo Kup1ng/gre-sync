@@ -1,0 +1,20 @@
+[Unit]
+Description=GRE Sync Daemon (healthcheck + coordinated reset)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/gre-sync/gre_syncd.py
+Restart=always
+RestartSec=2
+Environment=GRE_SYNC_CONFIG=/etc/gre-sync/config.yml
+
+# امنیت پایه
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
