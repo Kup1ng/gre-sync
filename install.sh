@@ -48,7 +48,6 @@ ask() {
       read -r -p "$prompt: " ans </dev/tty
     fi
   else
-    # no tty (non-interactive)
     ans="$default"
     echo "[!] No TTY detected; using default for: $prompt = $ans" >&2
   fi
@@ -109,6 +108,17 @@ write_wrapper() {
 exec $VENV_DIR/bin/python $APP_DIR/gre_cli.py "\$@"
 EOF
   chmod +x "$BIN_WRAPPER"
+}
+
+# Auto-detect Iran public IP on KH by reading peer of any gre-kh-* interface.
+# Example: "... link/gre <local> peer <peer>"
+detect_leader_ip_from_gre() {
+  ip -o link show 2>/dev/null \
+    | awk '
+      $0 ~ /: gre-kh-[0-9]+@/ && $0 ~ /link\/gre/ {
+        for (i=1; i<=NF; i++) if ($i=="peer") { print $(i+1); exit }
+      }
+    '
 }
 
 render_config_ir() {
@@ -227,12 +237,17 @@ main() {
       "$fail_rounds" "$reset_wait" \
       "$http_tries" "$http_timeout" "$http_backoff_base" "$http_backoff_cap" "$http_jitter_ratio"
   else
-    leader_ip="$(ask "Leader public IP (Iran public IP)" "")"
+    # KH: DO NOT ASK leader IP. Auto-detect from gre-kh-* peer.
+    leader_ip="$(detect_leader_ip_from_gre || true)"
     if [[ -z "$leader_ip" ]]; then
-      echo "[!] leader_public_ip is required for role=kh"
+      echo "[!] role=kh: could not auto-detect Iran public IP from gre-kh-* interfaces."
+      echo "    Please ensure at least one gre-kh-N interface exists before installing."
+      echo "    Example check: ip -o link show | grep -E \"gre-kh-[0-9]+\""
       exit 1
     fi
+    echo "[i] role=kh: detected leader_public_ip = $leader_ip"
 
+    # These are only for KH control-plane health gating (lightweight)
     leader_ping_count="$(ask "Leader ping count" "3")"
     leader_ping_timeout="$(ask "Leader ping timeout per packet (sec)" "1")"
     leader_loss_ok="$(ask "Leader loss threshold percent (< this = OK)" "20")"
