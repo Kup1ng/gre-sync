@@ -4,6 +4,7 @@ set -euo pipefail
 REPO_RAW_BASE="https://raw.githubusercontent.com/Kup1ng/gre-sync/main"
 
 APP_DIR="/opt/gre-sync"
+VENV_DIR="/opt/gre-sync/venv"
 CFG_DIR="/etc/gre-sync"
 CFG_FILE="$CFG_DIR/config.yml"
 SERVICE_FILE="/etc/systemd/system/gre-syncd.service"
@@ -59,16 +60,20 @@ PY
 
 install_apt_deps() {
   apt-get update -y
-  apt-get install -y python3 python3-pip
+  # python3-venv برای ساخت venv لازمه
+  apt-get install -y python3 python3-venv python3-pip curl
 }
 
-pip_deps() {
-  python3 -m pip install --no-cache-dir --upgrade pip >/dev/null
-  python3 -m pip install --no-cache-dir aiohttp pyyaml >/dev/null
+ensure_venv() {
+  if [[ ! -d "$VENV_DIR" ]]; then
+    python3 -m venv "$VENV_DIR"
+  fi
+  "$VENV_DIR/bin/python" -m pip install --upgrade pip >/dev/null
+  "$VENV_DIR/bin/pip" install --no-cache-dir aiohttp pyyaml >/dev/null
 }
 
 write_service() {
-  cat > "$SERVICE_FILE" <<'EOF'
+  cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=GRE Sync Daemon (healthcheck + coordinated reset)
 After=network-online.target
@@ -76,10 +81,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/gre-sync/gre_syncd.py
+ExecStart=$VENV_DIR/bin/python $APP_DIR/gre_syncd.py
 Restart=always
 RestartSec=2
-Environment=GRE_SYNC_CONFIG=/etc/gre-sync/config.yml
+Environment=GRE_SYNC_CONFIG=$CFG_FILE
 
 NoNewPrivileges=true
 ProtectSystem=full
@@ -92,9 +97,9 @@ EOF
 }
 
 write_wrapper() {
-  cat > "$BIN_WRAPPER" <<'EOF'
+  cat > "$BIN_WRAPPER" <<EOF
 #!/usr/bin/env bash
-exec /usr/bin/python3 /opt/gre-sync/gre_cli.py "$@"
+exec $VENV_DIR/bin/python $APP_DIR/gre_cli.py "\$@"
 EOF
   chmod +x "$BIN_WRAPPER"
 }
@@ -104,6 +109,7 @@ render_config() {
   local check_interval="$5" ping_count="$6" ping_timeout="$7" loss_ok="$8"
   local fail_rounds="$9" reset_wait="${10}"
 
+  mkdir -p "$CFG_DIR"
   cat > "$CFG_FILE" <<EOF
 role: ${role}
 listen: ${listen}
@@ -123,7 +129,7 @@ EOF
 main() {
   need_root
 
-  echo "=== GRE Sync installer ==="
+  echo "=== GRE Sync installer (venv / PEP668-safe) ==="
   echo "Repo: $REPO_RAW_BASE"
   echo
 
@@ -132,27 +138,22 @@ main() {
     exit 1
   fi
 
-  echo "[1/6] Installing system deps..."
+  echo "[1/7] Installing system deps..."
   install_apt_deps
 
-  echo "[2/6] Installing python deps..."
-  pip_deps
-
-  echo "[3/6] Creating directories..."
+  echo "[2/7] Creating directories..."
   mkdir -p "$APP_DIR" "$CFG_DIR"
 
-  echo "[4/6] Fetching project files from GitHub..."
+  echo "[3/7] Fetching project files from GitHub..."
   fetch "$REPO_RAW_BASE/gre_syncd.py" "$APP_DIR/gre_syncd.py"
   fetch "$REPO_RAW_BASE/gre_cli.py"  "$APP_DIR/gre_cli.py"
   chmod +x "$APP_DIR/gre_syncd.py" "$APP_DIR/gre_cli.py"
 
-  # service file: اگر تو repo داری و میخوای همونو استفاده کنی:
-  # fetch "$REPO_RAW_BASE/systemd/gre-syncd.service" "$SERVICE_FILE"
-  # ولی من برای اطمینان همینجا می‌سازمش:
-  write_service
+  echo "[4/7] Creating/Updating virtualenv + installing python deps..."
+  ensure_venv
 
   echo
-  echo "[5/6] Config setup (interactive)..."
+  echo "[5/7] Config setup (interactive)..."
 
   role="$(ask "Role? (ir/kh)" "ir")"
   if [[ "$role" != "ir" && "$role" != "kh" ]]; then
@@ -160,7 +161,6 @@ main() {
     exit 1
   fi
 
-  # پیشنهاد: API روی 0.0.0.0 فقط اگر میخوای peer بهش وصل شه
   listen="$(ask "API listen address" "0.0.0.0")"
   port="$(ask "API port" "8787")"
 
@@ -180,9 +180,11 @@ main() {
                 "$fail_rounds" "$reset_wait"
 
   echo
-  echo "[6/6] Installing CLI wrapper + enabling service..."
+  echo "[6/7] Installing systemd service + CLI wrapper..."
+  write_service
   write_wrapper
 
+  echo "[7/7] Enabling service..."
   systemctl daemon-reload
   systemctl enable --now gre-syncd
 
@@ -193,8 +195,8 @@ main() {
   echo "- Logs: journalctl -u gre-syncd -f"
   echo "- Menu CLI: gre"
   echo
-  echo "IMPORTANT:"
-  echo "- If you use firewall, allow TCP port $port ONLY between your servers (peer public IPs)."
+  echo "Firewall note:"
+  echo "- Allow TCP port $port only between your server public IPs."
 }
 
 main "$@"
