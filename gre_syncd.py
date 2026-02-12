@@ -195,6 +195,9 @@ class GreSyncD:
         self.fail_rounds = int(cfg.get("fail_confirm_rounds", 3))
         self.reset_wait = int(cfg.get("reset_wait_sec", 300))
 
+        # Delay between local UP and peer UP (IR only)
+        self.post_local_up_delay = int(cfg.get(\"post_local_up_delay_sec\", 10))
+
         # KH: control-plane (ping IR public) before accepting actions
         self.kh_ctl_ping_count = int(cfg.get("kh_ctl_ping_count", 3))
         self.kh_ctl_ping_timeout = int(cfg.get("kh_ctl_ping_timeout_sec", 1))
@@ -428,6 +431,11 @@ class GreSyncD:
                 self.log(f"[{iface.name}] UP local -> {up_local_ok}")
 
                 # then peer up (more retries)
+                # optional delay to let IR side stabilize before bringing peer up
+                if self.post_local_up_delay > 0:
+                    self.log(f\"[{iface.name}] Waiting {self.post_local_up_delay}s before UP peer\")
+                    await asyncio.sleep(self.post_local_up_delay)
+
                 r_up = await self.call_peer_retry(
                     iface.peer_public, "/action", {"action": "up", "ifname": peer_name},
                     timeout=8, tries=5, backoff_base=1.0, backoff_cap=12.0
