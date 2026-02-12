@@ -3,11 +3,12 @@ import json
 import os
 import subprocess
 import sys
-import textwrap
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 CFG = os.environ.get("GRE_SYNC_CONFIG", "/etc/gre-sync/config.yml")
+
+DEFAULT_REPO_RAW = "https://raw.githubusercontent.com/Kup1ng/gre-sync/main"
 
 def sh(cmd, check=False) -> str:
     p = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -19,7 +20,7 @@ def load_cfg() -> Dict[str, Any]:
     try:
         import yaml
     except ImportError:
-        print("pyyaml not installed. Run installer or: pip3 install pyyaml")
+        print("pyyaml not installed. Run installer.")
         sys.exit(1)
 
     try:
@@ -28,12 +29,11 @@ def load_cfg() -> Dict[str, Any]:
     except FileNotFoundError:
         return {}
 
-def curl_local(path: str, payload: Dict[str, Any], cfg: Dict[str, Any], timeout=5) -> Dict[str, Any]:
+def api_call_local(path: str, payload: Dict[str, Any], cfg: Dict[str, Any], timeout=5) -> Dict[str, Any]:
     import urllib.request
     import urllib.error
 
     listen = cfg.get("listen", "127.0.0.1")
-    # If service is listening on 0.0.0.0, call localhost.
     host = "127.0.0.1" if listen == "0.0.0.0" else listen
     port = int(cfg.get("port", 8787))
     token = cfg.get("token", "")
@@ -58,24 +58,24 @@ def menu_title(cfg: Dict[str, Any]) -> str:
     return f"GRE Menu (role={role}, api_port={port})"
 
 def pause():
-    input("\nEnter بزن برای برگشت... ")
+    input("\nPress Enter to go back... ")
 
 def print_box(txt: str):
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 72)
     print(txt)
-    print("=" * 70 + "\n")
+    print("=" * 72 + "\n")
 
 def pick_iface(ifaces: Dict[str, Any]) -> Optional[str]:
     names = sorted(ifaces.keys())
     if not names:
-        print("هیچ GRE پیدا نشد.")
+        print("No GRE interfaces found.")
         return None
     for i, n in enumerate(names, 1):
         info = ifaces[n]
-        print(f"{i}) {n}  peer_public={info.get('peer_public')}  peer_private={info.get('peer_private')}")
-    print("0) انصراف")
+        print(f"{i}) {n}  peer_public={info.get('peer_public')}  peer_private={info.get('peer_private')}  link_up={info.get('link_up')}  resetting={info.get('resetting')}")
+    print("0) Cancel")
     try:
-        c = int(input("انتخاب: ").strip() or "0")
+        c = int(input("Select: ").strip() or "0")
     except ValueError:
         return None
     if c == 0:
@@ -91,8 +91,42 @@ def service_status():
     print(sh(["systemctl", "status", "gre-syncd", "--no-pager"]))
 
 def logs_follow():
-    # interactive follow
     subprocess.run(["journalctl", "-u", "gre-syncd", "-f"])
+
+def detect_repo_raw(cfg: Dict[str, Any]) -> str:
+    return str(cfg.get("repo_raw_base", DEFAULT_REPO_RAW)).rstrip("/")
+
+def download_to(path: str, url: str):
+    if shutil_which("curl"):
+        sh(["curl", "-fsSL", url, "-o", path], check=True)
+    elif shutil_which("wget"):
+        sh(["wget", "-qO", path, url], check=True)
+    else:
+        raise RuntimeError("Neither curl nor wget found")
+
+def shutil_which(cmd: str) -> bool:
+    return subprocess.call(["bash", "-lc", f"command -v {cmd} >/dev/null 2>&1"]) == 0
+
+def do_update(cfg: Dict[str, Any]):
+    repo = detect_repo_raw(cfg)
+    app_dir = "/opt/gre-sync"
+    gre_syncd = os.path.join(app_dir, "gre_syncd.py")
+    gre_cli = os.path.join(app_dir, "gre_cli.py")
+
+    print(f"Updating from: {repo}")
+    tmp1 = gre_syncd + ".new"
+    tmp2 = gre_cli + ".new"
+
+    download_to(tmp1, f"{repo}/gre_syncd.py")
+    download_to(tmp2, f"{repo}/gre_cli.py")
+
+    os.replace(tmp1, gre_syncd)
+    os.replace(tmp2, gre_cli)
+    sh(["chmod", "+x", gre_syncd, gre_cli])
+
+    print("Restarting service...")
+    sh(["systemctl", "restart", "gre-syncd"], check=True)
+    print("Done. (If you changed CLI too, re-run: gre)")
 
 def main():
     cfg = load_cfg()
@@ -100,109 +134,85 @@ def main():
         os.system("clear" if os.name != "nt" else "cls")
         print_box(menu_title(cfg))
 
-        print("1) وضعیت daemon (API status)")
-        print("2) لیست GRE های سیستم (از API)")
-        print("3) چک یک‌باره همه GRE ها (daemon خودش موازی چک می‌کند)")
-        print("4) ریست هماهنگ یک GRE (Leader: reset / Follower: report)")
-        print("5) systemd: start")
-        print("6) systemd: stop")
-        print("7) systemd: restart")
-        print("8) systemd: status")
-        print("9) لاگ زنده (journalctl -f)")
-        print("0) خروج")
+        print("1) Daemon status (API /status)")
+        print("2) List GRE interfaces")
+        print("3) Schedule coordinated reset (leader only)")
+        print("4) systemd: start")
+        print("5) systemd: stop")
+        print("6) systemd: restart")
+        print("7) systemd: status")
+        print("8) Follow logs (journalctl -f)")
+        print("9) Update (download latest gre_syncd.py/gre_cli.py and restart)")
+        print("0) Exit")
 
-        choice = input("\nانتخاب: ").strip()
+        choice = input("\nSelect: ").strip()
 
         if choice == "0":
             return
 
         elif choice == "1":
-            r = curl_local("/status", {}, cfg)
-            print(json.dumps(r, indent=2, ensure_ascii=False))
+            r = api_call_local("/status", {}, cfg)
+            print(json.dumps(r, indent=2))
             pause()
 
         elif choice == "2":
-            r = curl_local("/status", {}, cfg)
+            r = api_call_local("/status", {}, cfg)
             if not r.get("ok"):
-                print(json.dumps(r, indent=2, ensure_ascii=False))
+                print(json.dumps(r, indent=2))
                 pause()
                 continue
             ifaces = r.get("ifaces", {})
             for k in sorted(ifaces.keys()):
                 v = ifaces[k]
-                print(f"- {k} | peer_public={v.get('peer_public')} | peer_private={v.get('peer_private')}")
+                print(f"- {k} | peer_public={v.get('peer_public')} | peer_private={v.get('peer_private')} | link_up={v.get('link_up')} | resetting={v.get('resetting')}")
+            if r.get("role") == "kh":
+                print("")
+                print(f"Leader IP: {r.get('leader_public_ip')}")
+                print(f"Leader ping ok: {r.get('leader_ping_ok')} loss={r.get('leader_ping_loss')} ts_ms={r.get('leader_ping_ts_ms')}")
             pause()
 
         elif choice == "3":
-            # One-shot check without modifying daemon: ask daemon status and show.
-            # The daemon is continuously checking; user can just observe status and logs.
-            print("این پروژه به صورت daemon دائم چک می‌کنه.")
-            print("برای دیدن نتیجه‌ها: گزینه 9 لاگ زنده رو باز کن.")
-            pause()
-
-        elif choice == "4":
-            r = curl_local("/status", {}, cfg)
-            if not r.get("ok"):
-                print(json.dumps(r, indent=2, ensure_ascii=False))
+            role = str(cfg.get("role", "ir")).lower()
+            if role != "ir":
+                print("Reset can only be scheduled on the leader (role=ir).")
                 pause()
                 continue
+
+            r = api_call_local("/status", {}, cfg)
+            if not r.get("ok"):
+                print(json.dumps(r, indent=2))
+                pause()
+                continue
+
             ifaces = r.get("ifaces", {})
             target = pick_iface(ifaces)
             if not target:
                 continue
 
-            role = cfg.get("role", "ir")
-            if role == "ir":
-                # Trigger by calling /report on itself with ifnum extracted from name
-                # /report expects ifnum
-                num = target.split("-")[-1]
-                rr = curl_local("/report", {"ifnum": num, "from_if": "cli", "from_peer": "local"}, cfg, timeout=8)
-                print(json.dumps(rr, indent=2, ensure_ascii=False))
-                print("\nاگر ok شد، reset زمان‌بندی شد. لاگ رو ببین (گزینه 9).")
-            else:
-                # On follower, we don't know leader IP from config; ask from API iface data
-                info = ifaces[target]
-                leader_ip = info.get("peer_public")
-                num = target.split("-")[-1]
-                if not leader_ip:
-                    print("leader ip پیدا نشد (peer_public خالیه).")
-                    pause()
-                    continue
-
-                # call leader /report using curl command (no extra deps)
-                token = cfg.get("token", "")
-                port = int(cfg.get("port", 8787))
-                payload = json.dumps({"ifnum": num, "from_if": target, "from_peer": "follower"}).encode()
-
-                # Use curl for simplicity
-                cmd = [
-                    "curl", "-sS", "-m", "8",
-                    "-H", f"Authorization: Bearer {token}",
-                    "-H", "Content-Type: application/json",
-                    "-d", payload.decode(),
-                    f"http://{leader_ip}:{port}/report"
-                ]
-                out = sh(cmd)
-                print(out)
-                print("\nReport به leader ارسال شد. لاگ leader رو ببین.")
+            num = target.split("-")[-1]
+            rr = api_call_local("/reset", {"ifnum": num}, cfg, timeout=8)
+            print(json.dumps(rr, indent=2))
+            print("\nIf scheduled, watch logs (option 8).")
             pause()
 
+        elif choice == "4":
+            service_ctl("start"); pause()
         elif choice == "5":
-            service_ctl("start")
-            pause()
+            service_ctl("stop"); pause()
         elif choice == "6":
-            service_ctl("stop")
-            pause()
+            service_ctl("restart"); pause()
         elif choice == "7":
-            service_ctl("restart")
-            pause()
+            service_status(); pause()
         elif choice == "8":
-            service_status()
-            pause()
-        elif choice == "9":
             logs_follow()
+        elif choice == "9":
+            try:
+                do_update(cfg)
+            except Exception as e:
+                print(f"Update failed: {e}")
+            pause()
         else:
-            print("گزینه نامعتبر.")
+            print("Invalid choice.")
             time.sleep(1)
 
 if __name__ == "__main__":
