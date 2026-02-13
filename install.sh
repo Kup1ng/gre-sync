@@ -110,17 +110,6 @@ EOF
   chmod +x "$BIN_WRAPPER"
 }
 
-# Auto-detect Iran public IP on KH by reading peer of any gre-kh-* interface.
-# Example: "... link/gre <local> peer <peer>"
-detect_leader_ip_from_gre() {
-  ip -o link show 2>/dev/null \
-    | awk '
-      $0 ~ /: gre-kh-[0-9]+@/ && $0 ~ /link\/gre/ {
-        for (i=1; i<=NF; i++) if ($i=="peer") { print $(i+1); exit }
-      }
-    '
-}
-
 render_config_ir() {
   local listen="$1" port="$2" token="$3"
   local check_interval="$4" ping_count="$5" ping_timeout="$6" loss_ok="$7"
@@ -151,9 +140,8 @@ EOF
 }
 
 render_config_kh() {
-  local listen="$1" port="$2" token="$3" leader_ip="$4"
-  local leader_ping_count="$5" leader_ping_timeout="$6" leader_loss_ok="$7"
-  local http_tries="$8" http_timeout="$9" http_backoff_base="${10}" http_backoff_cap="${11}" http_jitter_ratio="${12}"
+  local listen="$1" port="$2" token="$3"
+  local http_tries="$4" http_timeout="$5" http_backoff_base="$6" http_backoff_cap="$7" http_jitter_ratio="$8"
 
   mkdir -p "$CFG_DIR"
   cat > "$CFG_FILE" <<EOF
@@ -161,11 +149,6 @@ role: kh
 listen: ${listen}
 port: ${port}
 token: "${token}"
-
-leader_public_ip: "${leader_ip}"
-leader_ping_count: ${leader_ping_count}
-leader_ping_timeout_sec: ${leader_ping_timeout}
-leader_loss_ok_percent: ${leader_loss_ok}
 
 http_tries: ${http_tries}
 http_timeout_sec: ${http_timeout}
@@ -237,23 +220,8 @@ main() {
       "$fail_rounds" "$reset_wait" \
       "$http_tries" "$http_timeout" "$http_backoff_base" "$http_backoff_cap" "$http_jitter_ratio"
   else
-    # KH: DO NOT ASK leader IP. Auto-detect from gre-kh-* peer.
-    leader_ip="$(detect_leader_ip_from_gre || true)"
-    if [[ -z "$leader_ip" ]]; then
-      echo "[!] role=kh: could not auto-detect Iran public IP from gre-kh-* interfaces."
-      echo "    Please ensure at least one gre-kh-N interface exists before installing."
-      echo "    Example check: ip -o link show | grep -E \"gre-kh-[0-9]+\""
-      exit 1
-    fi
-    echo "[i] role=kh: detected leader_public_ip = $leader_ip"
-
-    # These are only for KH control-plane health gating (lightweight)
-    leader_ping_count="$(ask "Leader ping count" "3")"
-    leader_ping_timeout="$(ask "Leader ping timeout per packet (sec)" "1")"
-    leader_loss_ok="$(ask "Leader loss threshold percent (< this = OK)" "20")"
-
-    render_config_kh "$listen" "$port" "$token" "$leader_ip" \
-      "$leader_ping_count" "$leader_ping_timeout" "$leader_loss_ok" \
+    # KH: no leader IP detection/storage needed (daemon infers from gre-kh-* and uses ping -I)
+    render_config_kh "$listen" "$port" "$token" \
       "$http_tries" "$http_timeout" "$http_backoff_base" "$http_backoff_cap" "$http_jitter_ratio"
   fi
 
