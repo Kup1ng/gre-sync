@@ -124,8 +124,8 @@ def parse_gre_ifaces() -> Dict[str, GreIface]:
     return res
 
 
-async def ping_loss_percent(ip: str, count: int, timeout_sec: int) -> Optional[float]:
-    cmd = ["ping", "-n", "-q", "-c", str(count), "-W", str(timeout_sec), ip]
+async def ping_loss_percent(ip: str, count: int, timeout_sec: int, source_ip: Optional[str] = None) -> Optional[float]:
+    cmd = ["ping", "-n", "-q", "-c", str(count), "-W", str(timeout_sec)] + (["-I", source_ip] if source_ip else []) + [ip]
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
@@ -315,7 +315,13 @@ class GreSyncD:
                 self.log(f"[{ifname}] REFUSE {action}: {msg}")
                 return web.json_response({"ok": False, "err": "leader_unknown", "detail": msg}, status=503)
 
-            loss = await ping_loss_percent(leader_ip, self.kh_ctl_ping_count, self.kh_ctl_ping_timeout)
+            ifaces = parse_gre_ifaces()
+            src_ip = None
+            try:
+                src_ip = ifaces.get(ifname).local_public if ifaces.get(ifname) else None
+            except Exception:
+                src_ip = None
+            loss = await ping_loss_percent(leader_ip, self.kh_ctl_ping_count, self.kh_ctl_ping_timeout, source_ip=src_ip)
             ok = (loss is not None) and (loss < self.loss_ok)
             self._kh_leader_ok = ok
             self._kh_leader_loss = loss
@@ -472,8 +478,8 @@ class GreSyncD:
     # ----- Monitoring loops -----
 
     async def check_one(self, iface: GreIface) -> Tuple[bool, bool]:
-        loss_pub = await ping_loss_percent(iface.peer_public, self.ping_count, self.ping_timeout)
-        loss_prv = await ping_loss_percent(iface.peer_private, self.ping_count, self.ping_timeout)
+        loss_pub = await ping_loss_percent(iface.peer_public, self.ping_count, self.ping_timeout, source_ip=iface.local_public)
+        loss_prv = await ping_loss_percent(iface.peer_private, self.ping_count, self.ping_timeout, source_ip=iface.local_private)
 
         pub_ok = (loss_pub is not None) and (loss_pub < self.loss_ok)
         prv_ok = (loss_prv is not None) and (loss_prv < self.loss_ok)
@@ -556,7 +562,13 @@ class GreSyncD:
         while not self._stop.is_set():
             leader_ip = self.get_leader_ip()
             if leader_ip:
-                loss = await ping_loss_percent(leader_ip, self.kh_ctl_ping_count, self.kh_ctl_ping_timeout)
+                ifaces = parse_gre_ifaces()
+            src_ip = None
+            try:
+                src_ip = ifaces.get(ifname).local_public if ifaces.get(ifname) else None
+            except Exception:
+                src_ip = None
+            loss = await ping_loss_percent(leader_ip, self.kh_ctl_ping_count, self.kh_ctl_ping_timeout, source_ip=src_ip)
                 ok = (loss is not None) and (loss < self.loss_ok)
                 self._kh_leader_ok = ok
                 self._kh_leader_loss = loss
