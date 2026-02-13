@@ -67,7 +67,7 @@ PY
 
 install_apt_deps() {
   apt-get update -y
-  apt-get install -y python3 python3-venv python3-pip curl
+  apt-get install -y python3 python3-venv python3-pip curl hping3
 }
 
 ensure_venv() {
