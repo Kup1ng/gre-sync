@@ -125,20 +125,59 @@ def parse_gre_ifaces() -> Dict[str, GreIface]:
 
 
 async def ping_loss_percent(dest_ip: str, count: int, timeout_sec: int, source_ip: Optional[str] = None) -> Optional[float]:
-    cmd = ["ping", "-n", "-q", "-c", str(count), "-W", str(timeout_sec)]
+    """TCP 'ping' using hping3 SYN probes to port 22.
+
+    We keep the same function name/signature to avoid touching the rest of the code.
+    Loss is parsed from hping3 statistics (or derived from tx/rx if needed).
+
+    Notes:
+      - Requires hping3 installed.
+      - Uses '-a <source_ip>' to force the source IP (important when host has multiple IPs).
+      - Uses TCP SYN to port 22 by default (ssh port).
+    """
+    # hping3 sends raw packets; service must run as root (systemd default here is root).
+    # Interval: keep it reasonably fast so a full batch doesn't take too long.
+    interval_us = 200000  # 0.2s between probes
+
+    cmd = ["hping3", "-S", "-p", "22", "-c", str(count), "-i", f"u{interval_us}", "-n", "-q"]
     if source_ip:
-        cmd += ["-I", str(source_ip)]
-    cmd += [dest_ip]
+        # Force source IP (host must own this IP).
+        cmd += ["-a", str(source_ip)]
+    cmd += [str(dest_ip)]
+
+    # Total timeout: allow enough time for count probes + some slack.
+    total_timeout = max(3, int(count * (interval_us / 1_000_000) + (timeout_sec * 1.5) + 2))
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
         )
-        out, _ = await proc.communicate()
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=total_timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            out, _ = await proc.communicate()
+
         txt = out.decode(errors="ignore")
+
+        # Prefer explicit loss percent if present.
         m = re.search(r"(\d+(?:\.\d+)?)%\s+packet loss", txt)
-        if not m:
-            return None
-        return float(m.group(1))
+        if m:
+            return float(m.group(1))
+
+        # Fallback: derive from tx/rx.
+        m2 = re.search(r"(\d+)\s+packets transmitted,\s+(\d+)\s+packets received", txt)
+        if m2:
+            tx = int(m2.group(1))
+            rx = int(m2.group(2))
+            if tx <= 0:
+                return None
+            return (tx - rx) * 100.0 / tx
+
+        return None
+    except FileNotFoundError:
+        # hping3 not installed
+        return None
     except Exception:
         return None
 
