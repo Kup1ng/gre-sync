@@ -124,8 +124,11 @@ def parse_gre_ifaces() -> Dict[str, GreIface]:
     return res
 
 
-async def ping_loss_percent(ip: str, count: int, timeout_sec: int, source_ip: Optional[str] = None) -> Optional[float]:
-    cmd = ["ping", "-n", "-q", "-c", str(count), "-W", str(timeout_sec)] + (["-I", source_ip] if source_ip else []) + [ip]
+async def ping_loss_percent(dest_ip: str, count: int, timeout_sec: int, source_ip: Optional[str] = None) -> Optional[float]:
+    cmd = ["ping", "-n", "-q", "-c", str(count), "-W", str(timeout_sec)]
+    if source_ip:
+        cmd += ["-I", str(source_ip)]
+    cmd += [dest_ip]
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
@@ -316,12 +319,12 @@ class GreSyncD:
                 return web.json_response({"ok": False, "err": "leader_unknown", "detail": msg}, status=503)
 
             ifaces = parse_gre_ifaces()
-            src_ip = None
-            try:
-                src_ip = ifaces.get(ifname).local_public if ifaces.get(ifname) else None
-            except Exception:
-                src_ip = None
-            loss = await ping_loss_percent(leader_ip, self.kh_ctl_ping_count, self.kh_ctl_ping_timeout, source_ip=src_ip)
+            src_iface = ifaces.get(ifname)
+            if not src_iface:
+                msg = f"iface {ifname} not found for control-plane ping"
+                self.log(f"[{ifname}] REFUSE {action}: {msg}")
+                return web.json_response({"ok": False, "err": "iface_missing", "detail": msg}, status=503)
+            loss = await ping_loss_percent(leader_ip, self.kh_ctl_ping_count, self.kh_ctl_ping_timeout, source_ip=src_iface.local_public)
             ok = (loss is not None) and (loss < self.loss_ok)
             self._kh_leader_ok = ok
             self._kh_leader_loss = loss
@@ -562,13 +565,16 @@ class GreSyncD:
         while not self._stop.is_set():
             leader_ip = self.get_leader_ip()
             if leader_ip:
+                # pick a deterministic source IP from any local gre-kh-* (so ping uses correct src)
                 ifaces = parse_gre_ifaces()
-            src_ip = None
-            try:
-                src_ip = ifaces.get(ifname).local_public if ifaces.get(ifname) else None
-            except Exception:
                 src_ip = None
-            loss = await ping_loss_percent(leader_ip, self.kh_ctl_ping_count, self.kh_ctl_ping_timeout, source_ip=src_ip)
+                for _n, _i in ifaces.items():
+                    if _i.side == "kh":
+                        src_ip = _i.local_public
+                        break
+                if not src_ip:
+                    src_ip = None
+                loss = await ping_loss_percent(leader_ip, self.kh_ctl_ping_count, self.kh_ctl_ping_timeout, source_ip=src_ip)
                 ok = (loss is not None) and (loss < self.loss_ok)
                 self._kh_leader_ok = ok
                 self._kh_leader_loss = loss
