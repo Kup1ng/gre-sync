@@ -436,6 +436,9 @@ class GreSyncD:
                 up_local_ok = await ip_link_set(iface.name, "up")
                 self.log(f"[{iface.name}] UP local -> {up_local_ok}")
 
+                # wait 30s before bringing peer up
+                await asyncio.sleep(30)
+
                 # then peer up (more retries)
                 r_up = await self.call_peer_retry(
                     iface.peer_public, "/action", {"action": "up", "ifname": peer_name},
