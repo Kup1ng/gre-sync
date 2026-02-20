@@ -382,12 +382,15 @@ class GreSyncD:
 
     async def coordinated_reset_as_leader(self, iface: GreIface):
         """
-        IR leader does:
+        IR leader sequence (as requested):
           - barrier with KH (must succeed)
-          - DOWN local + KH (KH must ACK down, otherwise abort and restore local up)
+          - DOWN peer (KH) first; only if it confirms DOWN -> DOWN local (IR)
           - wait reset_wait
-          - UP local (IR first)
-          - UP KH (retry more)
+          - UP peer (KH) first; only if it confirms UP -> wait 3s -> UP local (IR)
+
+        Notes:
+          - local iface stays in self._resetting for the whole window, so monitoring skips it.
+          - if peer DOWN/UP can't be confirmed, we abort to avoid desync.
         """
         if self.role != "ir":
             return
@@ -414,46 +417,53 @@ class GreSyncD:
                     self.log(f"[{iface.name}] barrier failed/not-ready -> {b}")
                     return
 
-                # down both (peer must succeed)
-                down_peer_task = self.call_peer_retry(
-                    iface.peer_public, "/action", {"action": "down", "ifname": peer_name}, timeout=8, tries=3
+                # 1) DOWN peer first
+                r_peer_down = await self.call_peer_retry(
+                    iface.peer_public, "/action", {"action": "down", "ifname": peer_name}, timeout=10, tries=3
                 )
-                down_local_task = ip_link_set(iface.name, "down")
-                r_peer, r_local = await asyncio.gather(down_peer_task, down_local_task, return_exceptions=True)
-
-                peer_down_ok = isinstance(r_peer, dict) and (r_peer.get("ok") is True)
-                local_down_ok = (r_local is True)
-                self.log(f"[{iface.name}] DOWN local={local_down_ok} peer={r_peer}")
+                peer_down_ok = isinstance(r_peer_down, dict) and (r_peer_down.get("ok") is True)
+                self.log(f"[{iface.name}] DOWN peer -> {r_peer_down}")
 
                 if not peer_down_ok:
-                    self.log(f"[{iface.name}] peer DOWN failed -> abort reset, restoring local UP")
-                    await ip_link_set(iface.name, "up")
+                    self.log(f"[{iface.name}] peer DOWN not confirmed -> abort reset (local unchanged)")
                     return
 
+                # 2) DOWN local only after peer DOWN confirmed
+                local_down_ok = await ip_link_set(iface.name, "down")
+                self.log(f"[{iface.name}] DOWN local -> {local_down_ok}")
+                if not local_down_ok:
+                    # try to bring peer back up to reduce mismatch
+                    self.log(f"[{iface.name}] local DOWN failed; trying to restore peer UP")
+                    await self.call_peer_retry(
+                        iface.peer_public, "/action", {"action": "up", "ifname": peer_name},
+                        timeout=10, tries=3, backoff_base=1.0, backoff_cap=10.0
+                    )
+                    return
+
+                # wait configured time
                 await asyncio.sleep(self.reset_wait)
 
-                # up local first
-                up_local_ok = await ip_link_set(iface.name, "up")
-                self.log(f"[{iface.name}] UP local -> {up_local_ok}")
-
-                # wait 30s before bringing peer up
-                await asyncio.sleep(30)
-
-                # then peer up (more retries)
-                r_up = await self.call_peer_retry(
+                # 3) UP peer first
+                r_peer_up = await self.call_peer_retry(
                     iface.peer_public, "/action", {"action": "up", "ifname": peer_name},
-                    timeout=8, tries=5, backoff_base=1.0, backoff_cap=12.0
+                    timeout=10, tries=5, backoff_base=1.0, backoff_cap=12.0
                 )
-                if not (isinstance(r_up, dict) and r_up.get("ok") is True):
-                    self.log(f"[{iface.name}] peer UP did not confirm -> {r_up}")
-                else:
-                    self.log(f"[{iface.name}] UP peer -> {r_up}")
+                peer_up_ok = isinstance(r_peer_up, dict) and (r_peer_up.get("ok") is True)
+                self.log(f"[{iface.name}] UP peer -> {r_peer_up}")
+
+                if not peer_up_ok:
+                    self.log(f"[{iface.name}] peer UP not confirmed -> keep local DOWN and abort")
+                    return
+
+                # 4) wait 3 seconds then UP local
+                await asyncio.sleep(3)
+                local_up_ok = await ip_link_set(iface.name, "up")
+                self.log(f"[{iface.name}] UP local -> {local_up_ok}")
 
                 self.log(f"[{iface.name}] Coordinated reset END")
 
             finally:
                 self._resetting.discard(iface.name)
-
     # ----- Leader-only reset endpoint -----
 
     async def api_reset(self, request: web.Request):
