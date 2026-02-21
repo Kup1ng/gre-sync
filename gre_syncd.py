@@ -443,16 +443,26 @@ class GreSyncD:
                 # wait configured time
                 await asyncio.sleep(self.reset_wait)
 
-                # 3) UP peer first
-                r_peer_up = await self.call_peer_retry(
-                    iface.peer_public, "/action", {"action": "up", "ifname": peer_name},
-                    timeout=10, tries=5, backoff_base=1.0, backoff_cap=12.0
-                )
-                peer_up_ok = isinstance(r_peer_up, dict) and (r_peer_up.get("ok") is True)
-                self.log(f"[{iface.name}] UP peer -> {r_peer_up}")
+                # 3) UP peer first (retry every 60s until confirmed)
+                peer_up_ok = False
+                while not self._stop.is_set():
+                    r_peer_up = await self.call_peer_retry(
+                        iface.peer_public, "/action", {"action": "up", "ifname": peer_name},
+                        timeout=10, tries=5, backoff_base=1.0, backoff_cap=12.0
+                    )
+                    peer_up_ok = isinstance(r_peer_up, dict) and (r_peer_up.get("ok") is True)
+                    self.log(f"[{iface.name}] UP peer -> {r_peer_up}")
+
+                    if peer_up_ok:
+                        break
+
+                    # Do NOT bring local up; keep it DOWN and retry later
+                    self.log(f"[{iface.name}] peer UP not confirmed; retrying in 60s (local stays DOWN)")
+                    await asyncio.sleep(60)
 
                 if not peer_up_ok:
-                    self.log(f"[{iface.name}] peer UP not confirmed -> keep local DOWN and abort")
+                    # stop requested
+                    self.log(f"[{iface.name}] stop requested while waiting for peer UP; aborting with local DOWN")
                     return
 
                 # 4) wait 3 seconds then UP local
